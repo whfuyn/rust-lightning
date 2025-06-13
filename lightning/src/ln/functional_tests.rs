@@ -11765,3 +11765,142 @@ pub fn test_funding_signed_event() {
 	nodes[0].node.get_and_clear_pending_msg_events();
 	nodes[1].node.get_and_clear_pending_msg_events();
 }
+
+#[xtest(feature = "_externalize_tests")]
+pub fn test_claimed_htlcs_not_in_pending_claim_requests() {
+	use crate::events::bump_transaction::sync::WalletSourceSync;
+
+	// ====== TEST SETUP ======
+	let chanmon_cfgs = create_chanmon_cfgs(2);
+	let node_cfgs = create_node_cfgs(2, &chanmon_cfgs);
+
+	let mut user_cfg = test_default_channel_config();
+
+	// Anchor channels are required so that multiple HTLC-Successes can be aggregated into a single
+	// transaction.
+	user_cfg.channel_handshake_config.negotiate_anchors_zero_fee_htlc_tx = true;
+	user_cfg.manually_accept_inbound_channels = true;
+
+	let configs = [Some(user_cfg.clone()), Some(user_cfg.clone())];
+	let node_chanmgrs = create_node_chanmgrs(2, &node_cfgs, &configs);
+	let nodes = create_network(2, &node_cfgs, &node_chanmgrs);
+
+	let node_a_id = nodes[0].node.get_our_node_id();
+	let node_b_id = nodes[1].node.get_our_node_id();
+
+	// Since we're using anchor channels, make sure each node has a UTXO for paying fees.
+	let coinbase_tx = Transaction {
+		version: Version::TWO,
+		lock_time: LockTime::ZERO,
+		input: vec![TxIn { ..Default::default() }],
+		output: vec![
+			TxOut {
+				value: Amount::ONE_BTC,
+				script_pubkey: nodes[0].wallet_source.get_change_script().unwrap(),
+			},
+			TxOut {
+				value: Amount::ONE_BTC,
+				script_pubkey: nodes[1].wallet_source.get_change_script().unwrap(),
+			},
+		],
+	};
+	nodes[0].wallet_source.add_utxo(
+		bitcoin::OutPoint { txid: coinbase_tx.compute_txid(), vout: 0 },
+		coinbase_tx.output[0].value,
+	);
+	nodes[1].wallet_source.add_utxo(
+		bitcoin::OutPoint { txid: coinbase_tx.compute_txid(), vout: 1 },
+		coinbase_tx.output[1].value,
+	);
+
+	const CHAN_CAPACITY: u64 = 10_000_000;
+	let (_, _, cid, funding_tx) =
+		create_announced_chan_between_nodes_with_value(&nodes, 0, 1, CHAN_CAPACITY, 0);
+
+	// Ensure all nodes are at the same initial height.
+	let node_max_height = nodes.iter().map(|node| node.best_block_info().1).max().unwrap();
+	for node in &nodes {
+		let blocks_to_mine = node_max_height - node.best_block_info().1;
+		if blocks_to_mine > 0 {
+			connect_blocks(node, blocks_to_mine);
+		}
+	}
+
+	// ====== TEST PROCESS ======
+
+	// Route HTLC 1 and 2 from A to B.
+	let (preimage_1, payment_hash_1, ..) = route_payment(&nodes[0], &[&nodes[1]], 1_000_000);
+	let (_preimage_2, _payment_hash_2, ..) = route_payment(&nodes[0], &[&nodes[1]], 1_000_000);
+
+	// Node B claims HTLC 1.
+	nodes[1].node.claim_funds(preimage_1);
+	expect_payment_claimed!(nodes[1], payment_hash_1, 1_000_000);
+	check_added_monitors(&nodes[1], 1);
+	let _ = get_htlc_update_msgs(&nodes[1], &node_a_id);
+
+	// Force close the channel by broadcasting node B's commitment tx.
+	let node_b_commit_tx = get_local_commitment_txn!(nodes[1], cid);
+	assert_eq!(node_b_commit_tx.len(), 1);
+	let node_b_commit_tx = &node_b_commit_tx[0];
+	check_spends!(node_b_commit_tx, funding_tx);
+
+	mine_transaction(&nodes[0], node_b_commit_tx);
+	check_closed_event(
+		&nodes[0],
+		1,
+		ClosureReason::CommitmentTxConfirmed,
+		false,
+		&[node_b_id],
+		CHAN_CAPACITY,
+	);
+	check_closed_broadcast!(nodes[0], true);
+	check_added_monitors(&nodes[0], 1);
+
+	mine_transaction(&nodes[1], node_b_commit_tx);
+	check_closed_event(
+		&nodes[1],
+		1,
+		ClosureReason::CommitmentTxConfirmed,
+		false,
+		&[node_a_id],
+		CHAN_CAPACITY,
+	);
+	check_closed_broadcast!(nodes[1], true);
+	check_added_monitors(&nodes[1], 1);
+
+	// Confirm HTLC 1 claiming tx on node A.
+	let process_bump_event = |node: &Node| {
+		let events = node.chain_monitor.chain_monitor.get_and_clear_pending_events();
+		assert_eq!(events.len(), 1);
+		let bump_event = match &events[0] {
+			Event::BumpTransaction(bump_event) => bump_event,
+			e => panic!("Unexepected event: {:#?}", e),
+		};
+		node.bump_tx_handler.handle_event(bump_event);
+
+		let mut tx = node.tx_broadcaster.txn_broadcast();
+		assert_eq!(tx.len(), 1);
+		tx.pop().unwrap()
+	};
+	let bs_htlc_1_claiming_tx = process_bump_event(&nodes[1]);
+
+	mine_transaction(&nodes[0], &bs_htlc_1_claiming_tx);
+	// Node A reaches the HTLC timeout height.
+	connect_blocks(&nodes[0], TEST_FINAL_CLTV - 1);
+
+	// Check that node A times out only HTLC 2, and does not attempt to timeout the already
+	// claimed HTLC 1.
+	let timeout_tx = {
+		let mut txs = nodes[0].tx_broadcaster.txn_broadcast();
+		assert_eq!(txs.len(), 1);
+		txs.pop().unwrap()
+	};
+	let htlc_already_claimed = bs_htlc_1_claiming_tx.input.iter().any(|htlc|{
+		htlc.previous_output == timeout_tx.input[0].previous_output
+	});
+	assert!(!htlc_already_claimed, "HTLC already claimed by counterparty's HTLC-Success transaction");
+	assert_eq!(timeout_tx.input.len(), 1);
+
+	let events = nodes[0].node.get_and_clear_pending_events();
+	assert_eq!(events.len(), 2);
+}

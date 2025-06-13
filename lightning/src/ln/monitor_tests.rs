@@ -752,7 +752,7 @@ fn do_test_claim_value_force_close(anchors: bool, prev_commitment_tx: bool) {
 	// Aggregated claim transaction.
 	assert_eq!(a_broadcast_txn.len(), 1);
 	check_spends!(a_broadcast_txn[0], remote_txn[0]);
-	assert_eq!(a_broadcast_txn[0].input.len(), 2);
+	assert_eq!(a_broadcast_txn[0].input.len(), 1);
 	assert_ne!(a_broadcast_txn[0].input[0].previous_output.vout, a_broadcast_txn[0].input[1].previous_output.vout);
 	// a_broadcast_txn [0] and [1] should spend the HTLC outputs of the commitment tx
 	assert!(a_broadcast_txn[0].input.iter().any(|input| remote_txn[0].output[input.previous_output.vout as usize].value.to_sat() == 3_000));
